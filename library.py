@@ -1,35 +1,36 @@
-import plistlib
-import os
-import regex as re
-from urllib.parse import unquote
-import shutil
+'''Recover playlists from iTunes music library XML.
+'''
 import logging
+import os
+import plistlib
+import shutil
+from urllib.parse import unquote
 
+import regex as re
+from multiprocess import Pool, cpu_count
 
 logger = logging.getLogger(__name__)
 
 
 class Library(object):
-    def __init__(self, itunes_path):
-        self.itunes_path = itunes_path
-        self.library_path = self.find_library_path()
-        self.library = None
+    '''
+    '''
+    def __init__(self, library_filename, itunes_directory=None):
+        '''
 
-        if self.library_path is not None:
-            with open(self.library_path, 'rb') as f:
-                self.library = plistlib.load(f)
-            logger.info('Successfully loaded {}'.format(self.library_path))
+        `library_filename` or `itunes_directory` will be tilde expanded.
 
-    def find_library_path(self):
-        for fn in os.listdir(self.itunes_path):
-            if fn.startswith('iTunes Music Library.xml'):
-                break
-        else:
-            logging.warning('Unable to find iTunes Library path in {}'
-                            .format(self.itunes_path))
-            return None
+        If `itunes_directory` is None, it's set to the parent directory of
+        `library_filename`.
+        '''
+        self.library_filename = os.path.expanduser(library_filename)
+        if itunes_directory is None:
+            self.itunes_directory = os.path.dirname(self.library_filename)
 
-        return os.path.join(self.itunes_path, fn)
+        with open(self.library_filename, 'rb') as f:
+            self.library = plistlib.load(f)
+        logger.info('Successfully loaded {}'
+                    .format(self.library_filename))
 
     def playlist_paths(self):
         '''Construct playlist hierarchy referenced by "Persistent ID"s, which we call
@@ -71,39 +72,74 @@ class Library(object):
             tid = str(tid)  # for some reason the itl has both :(
         track = self.library['Tracks'][tid]
         path = unquote(track['Location'])
-        return re.sub(r'file://.*/iTunes/', self.itunes_path, path)
+        repl = os.path.join(self.itunes_directory, '')  # end in slash
+        path = re.sub(r'file://.*/iTunes/', repl, path)
+        if os.path.exists(path):
+            return path
+
+        # Now we have to try harder...
+
+        def normalize(filename):
+            return re.sub(r'^[\d- ]+', '', filename)
+
+        target = normalize(os.path.basename(path))
+        dirname = os.path.dirname(path)
+        seen = set()
+        max_steps = 2
+
+        for _ in range(max_steps):
+            if dirname in seen:
+                continue
+            seen.add(dirname)
+            for dirpath, _, filenames in os.walk(dirname):
+                for filename in filenames:
+                    if normalize(filename) == target:
+                        return os.path.join(dirpath, filename)
+            dirname = os.path.dirname(dirname)
+
+        return path
 
     def copy_playlist_tracks(self, playlist, dst):
         for track in playlist['Playlist Items']:
             track_path = self.path_of_track(track['Track ID'])
             try:
                 shutil.copy(track_path, dst)
+            except KeyboardInterrupt:
+                exit(1)
             except:
                 logger.warning("Can't find {} for playlist {}"
                                .format(track_path, playlist['Name']))
 
-    def copy_playlists(self, root_path):
-        # create folders for playlists
-        playlists, paths = self.playlist_paths()
+    def copy_playlists(self, target_directory):
+        '''Copy playlists from iTunes library to `target_directory`.
+        '''
+        target_directory = os.path.expanduser(target_directory)
+        playlists, pid_paths = self.playlist_paths()
 
-        paths = sorted(paths)
-        for pid_path in paths:
+        def copy_playlist(pid_path):
             named_path = '/'.join(playlists[pid]['Name'] for pid in pid_path)
-            directory = os.path.join(root_path, named_path)
+            directory = os.path.join(target_directory, named_path)
             if not os.path.exists(directory):
                 os.makedirs(directory)
-
             playlist = playlists[pid_path[-1]]
             self.copy_playlist_tracks(playlist, directory)
+
+        pid_paths = sorted(pid_paths)
+
+        pool = Pool(processes=cpu_count())
+        for _ in pool.imap_unordered(copy_playlist, pid_paths):
+            pass
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    itunes_path = ('/Volumes/Manticore 2/Henry’s MacBook Pro (2)/'
-                   '2015-07-03-161447/Macintosh HD/Users/henry/'
-                   'Music/iTunes/')
-    library = Library(itunes_path)
-    library.copy_playlists(os.path.expanduser('/Volumes/DELPHI/old-playlists'))
+    library_filename = ('/Volumes/Manticore 2/Henry’s MacBook Pro (2)/'
+                        '2015-07-03-161447/Macintosh HD/Users/henry/'
+                        'Music/iTunes/iTunes Music Library.xml.last')
+    library = Library(library_filename)
+
+    target_directory = '~/Desktop/playlists/'
+    library.copy_playlists(target_directory)
 
 
 if __name__ == '__main__':
